@@ -94,6 +94,12 @@ class DashboardConfig:
     AUDIO_CHANNELS: int = 2
     AUDIO_DTYPE: str = 'int16'
     VOICE_ACTIVATION_THRESHOLD: float = 500.0
+    # FIX: Delay before recording after speaking to prevent self-recording
+    # Reason: speak_text() launches Windows Media Player asynchronously (non-blocking)
+    # Without this delay, record_audio() starts while audio is still playing
+    # Microphone picks up speaker output = echo/self-recording artifact
+    # Set to 15 seconds to allow typical TTS audio to complete playback before next recording
+    AUDIO_PLAYBACK_DELAY: int = 15
     
     # Vision Settings
     CAMERA_INDEX: int = 0
@@ -1344,6 +1350,17 @@ class DashboardAGI:
             
             # Speak response
             self.audio.speak_text(response)
+            
+            # FIX for self-recording issue: Wait for audio playback to finish
+            # PROBLEM: speak_text() uses os.system(f"start {speech_path}") which launches
+            # Windows Media Player asynchronously and returns immediately without waiting
+            # SOLUTION: Add delay before next recording cycle to ensure playback completes
+            # REASON: If recording starts while playback is ongoing, microphone captures
+            # the speaker output, creating an echo that gets recorded and transcribed
+            # TIMING: 15 seconds allows most conversational responses to finish playing
+            # before the system is ready to listen again
+            self.logger.info(f"Waiting {self.config.AUDIO_PLAYBACK_DELAY} seconds for audio playback to complete...")
+            time.sleep(self.config.AUDIO_PLAYBACK_DELAY)
             
         except Exception as e:
             self.logger.error(f"Voice interaction error: {e}")
