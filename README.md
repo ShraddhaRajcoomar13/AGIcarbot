@@ -78,7 +78,7 @@ DashboardAGI
 
 ```bash
 git clone <repository-url>
-cd dashboard-agi
+cd AGIcarbot
 ```
 
 ### 2. Create Virtual Environment
@@ -91,7 +91,7 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 ### 3. Install Dependencies
 
 ```bash
-pip install -r requirements_agi.txt
+pip install -r requirements.txt
 ```
 
 ### 4. Install System Audio Player
@@ -164,7 +164,7 @@ OBD_POLL_INTERVAL=2
 ### Basic Operation
 
 ```bash
-python dashboard_agi.py
+python main.py
 ```
 
 The system will:
