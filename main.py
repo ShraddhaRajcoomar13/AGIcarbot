@@ -12,8 +12,8 @@ import logging
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple, Any
 from dataclasses import dataclass, field
-from collections import Counter, deque
-from datetime import datetime, timedelta
+from collections import deque
+from datetime import datetime
 import json
 import threading
 from queue import Queue, Empty
@@ -90,7 +90,7 @@ class DashboardConfig:
     
     # Audio Settings
     SAMPLE_RATE: int = 44100
-    RECORDING_DURATION: int = 5
+    RECORDING_DURATION: int = 10
     AUDIO_CHANNELS: int = 2
     AUDIO_DTYPE: str = 'int16'
     VOICE_ACTIVATION_THRESHOLD: float = 500.0
@@ -103,9 +103,9 @@ class DashboardConfig:
     
     # Vision Settings
     CAMERA_INDEX: int = 0
-    VISION_ANALYSIS_INTERVAL: int = 180  # 3 minutes in seconds
-    FRAME_WIDTH: int = 1280
-    FRAME_HEIGHT: int = 720
+    VISION_ANALYSIS_INTERVAL: int = 10  # 3 minutes in seconds
+    FRAME_WIDTH: int = 800
+    FRAME_HEIGHT: int = 600
     SAVE_ANALYZED_FRAMES: bool = True
     
     # OBD-II Settings
@@ -650,6 +650,10 @@ class DashcamVision:
         # Check for motorcycles
         if objects.get('motorcycle', 0) > 0:
             hazards.append(f"Motorcycles nearby ({objects['motorcycle']})")
+
+        # Check for cars
+        if objects.get('car', 0) > 0:
+            hazards.append(f"Cars detected ({objects['car']})")
         
         # Check for animals
         for animal in ['dog', 'cat', 'bird', 'horse']:
@@ -1005,6 +1009,253 @@ class AudioHandler:
         except Exception as e:
             self.logger.warning(f"Cleanup of speech files failed: {e}")
 
+
+# ============================================================================
+# Keyword Detection Module
+# ============================================================================
+
+class KeywordDetector:
+    """
+    Simple keyword detection for wake-word functionality.
+    Detects when a specific keyword (e.g., "hello baby") is spoken.
+    
+    FUTURE ENHANCEMENT: Can be upgraded to ML-based detectors like:
+    - Google Snowboy (offline, always-listening)
+    - Porcupine by PicoVoice (fast, accurate)
+    - Custom TensorFlow models for specific phrases
+    """
+    
+    def __init__(self, keyword: str = "hello baby"):
+        """
+        Initialize keyword detector.
+        
+        Args:
+            keyword: The phrase to listen for (case-insensitive)
+        """
+        self.keyword = keyword.lower()
+    
+    def detect(self, text: str) -> bool:
+        """
+        Check if keyword is present in transcribed text.
+        
+        Args:
+            text: Transcribed audio text to search
+            
+        Returns:
+            True if keyword found, False otherwise
+        """
+        return self.keyword in text.lower()
+
+
+class AudioListener:
+    """
+    Background thread that continuously listens for audio and detects wake words.
+    
+    This is the KEY COMPONENT for always-listening functionality:
+    - Runs in a separate daemon thread to avoid blocking main thread
+    - Continuously records short audio chunks (1-2 seconds)
+    - Transcribes each chunk and checks for the keyword
+    - Signals main thread via threading.Event when keyword is detected
+    - Main thread remains responsive for other tasks (alerts, OBD, vision)
+    
+    Thread Safety:
+    - Uses threading.Event for clean thread synchronization
+    - Non-blocking wait in main loop via .wait(timeout=x)
+    """
+    
+    def __init__(self, audio_handler: AudioHandler, keyword_detector: KeywordDetector, logger: logging.Logger):
+        """
+        Initialize audio listener.
+        
+        Args:
+            audio_handler: AudioHandler instance for recording/transcription
+            keyword_detector: KeywordDetector instance for wake-word detection
+            logger: Logger instance for debug output
+        """
+        self.audio = audio_handler
+        self.detector = keyword_detector
+        self.logger = logger
+        
+        # Thread state
+        self.running = False
+        self.thread: Optional[threading.Thread] = None
+        
+        # Thread synchronization event: set when keyword is detected
+        # Main thread waits on this event instead of blocking on record_audio()
+        self.keyword_detected_event = threading.Event()
+        
+        self.logger.debug(f"AudioListener initialized with keyword: '{self.detector.keyword}'")
+    
+    def start(self):
+        """Start the background listening thread."""
+        if self.running:
+            self.logger.warning("AudioListener already running")
+            return
+        
+        self.running = True
+        # Daemon thread: will auto-terminate when main program exits
+        self.thread = threading.Thread(target=self._listen_loop, daemon=True, name="AudioListener")
+        self.thread.start()
+        self.logger.info("AudioListener thread started - continuously listening for wake word")
+    
+    def stop(self):
+        """Stop the background listening thread gracefully."""
+        if not self.running:
+            return
+        
+        self.logger.info("Stopping AudioListener thread...")
+        self.running = False
+        if self.thread:
+            # Wait up to 2 seconds for thread to finish
+            self.thread.join(timeout=2)
+            self.logger.debug("AudioListener thread stopped")
+    
+    def reset_detection(self):
+        """Reset the keyword detection event (call after handling detected keyword)."""
+        self.keyword_detected_event.clear()
+    
+    def _listen_loop(self):
+        """
+        Background listening loop - runs in separate thread.
+        
+        This loop:
+        1. Records short audio chunks (2 seconds vs 5 for faster response)
+        2. Transcribes each chunk
+        3. Checks for the keyword
+        4. Sets event to signal main thread when keyword is found
+        5. Continues running indefinitely while self.running=True
+        
+        The main thread can call wait(timeout) on the event instead of blocking.
+        """
+        self.logger.debug("Entering listen loop - will record 2-second chunks continuously")
+        
+        while self.running:
+            try:
+                # Record a short 2-second audio chunk (faster response than 5 seconds)
+                # This reduces latency from when user says "hello baby" to when system responds
+                audio_file = self.audio.record_audio(duration=5)
+                
+                # Transcribe the audio chunk
+                text = self.audio.transcribe_audio(audio_file)
+                
+                # Only process if transcription was successful (non-empty string)
+                if text:
+                    self.logger.debug(f"[LISTENER] Heard: '{text}'")
+                    
+                    # Check if keyword is present in the transcribed text
+                    if self.detector.detect(text):
+                        self.logger.info(f"KEYWORD DETECTED: '{text}' (trigger word: '{self.detector.keyword}')")
+                        # Signal main thread that wake word was detected
+                        # Main thread is waiting on: if listener.keyword_detected_event.wait(timeout=0.5)
+                        self.keyword_detected_event.set()
+                        # Don't continue recording until main thread resets the event
+                        # This prevents multiple detections while processing
+            
+            except Exception as e:
+                self.logger.error(f"AudioListener error: {e}")
+                # Sleep briefly to prevent error spam
+                time.sleep(1)
+
+# ============================================================================
+# Vision Monitor Module
+# ============================================================================
+
+class VisionMonitor:
+    """
+    Background thread for continuous vision analysis and hazard detection.
+    
+    Parallel to AudioListener but for vision:
+    - Runs in separate daemon thread
+    - Continuously captures and analyzes frames
+    - Detects hazards and puts alerts in shared queue
+    - Main thread processes alerts non-blocking
+    - Similar modular design for easy enable/disable
+    """
+    
+    def __init__(self, vision_handler: DashcamVision, alert_queue: Queue, config: DashboardConfig, logger: logging.Logger):
+        """
+        Initialize vision monitor.
+        
+        Args:
+            vision_handler: DashcamVision instance for frame capture/analysis
+            alert_queue: Shared queue for sending hazard alerts to main thread
+            config: DashboardConfig for vision settings
+            logger: Logger instance for debug output
+        """
+        self.vision = vision_handler
+        self.alert_queue = alert_queue
+        self.config = config
+        self.logger = logger
+        
+        # Thread state
+        self.running = False
+        self.thread: Optional[threading.Thread] = None
+        
+        self.logger.debug("VisionMonitor initialized")
+    
+    def start(self):
+        """Start the background vision monitoring thread."""
+        if self.running:
+            self.logger.warning("VisionMonitor already running")
+            return
+        
+        self.running = True
+        self.thread = threading.Thread(target=self._monitor_loop, daemon=True, name="VisionMonitor")
+        self.thread.start()
+        self.logger.info("VisionMonitor thread started - continuously analyzing camera feed")
+    
+    def stop(self):
+        """Stop the background vision monitoring thread."""
+        if not self.running:
+            return
+        
+        self.logger.info("Stopping VisionMonitor thread...")
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=2)
+            self.logger.debug("VisionMonitor thread stopped")
+    
+    def _monitor_loop(self):
+        """
+        Background loop that continuously captures and analyzes vision.
+        
+        This runs independently from the main thread:
+        1. Capture frame from camera
+        2. Run YOLO analysis on frame
+        3. Save analyzed frame
+        4. If hazards detected, put alert in queue (main thread processes)
+        5. Wait VISION_ANALYSIS_INTERVAL seconds before next capture
+        
+        Hazards are communicated to main thread via alert_queue.
+        Main thread processes them asynchronously when not handling voice.
+        """
+        self.logger.debug("Entering vision monitor loop - will analyze frames every " + 
+                         f"{self.config.VISION_ANALYSIS_INTERVAL}s")
+        
+        while self.running:
+            try:
+                # Capture and analyze frame
+                frame = self.vision.capture_frame()
+                if frame is not None:
+                    # Analyze frame for objects and hazards
+                    analysis = self.vision.analyze_frame(frame)
+                    
+                    # Save the analyzed frame for review/debugging
+                    self.vision.save_frame(frame)
+                    
+                    # Check for hazards and queue alerts for main thread
+                    if analysis.hazards_detected:
+                        for hazard in analysis.hazards_detected:
+                            self.alert_queue.put((AlertLevel.WARNING, hazard))
+                            self.logger.debug(f"Vision hazard detected: {hazard}")
+                
+                # Sleep until next analysis
+                time.sleep(self.config.VISION_ANALYSIS_INTERVAL)
+                
+            except Exception as e:
+                self.logger.error(f"VisionMonitor error: {e}")
+                time.sleep(30)  # Back off before retrying
+
 # ============================================================================
 # AGI Brain Module
 # ============================================================================
@@ -1212,6 +1463,38 @@ class DashboardAGI:
         self.audio = AudioHandler(config, self.logger)
         self.brain = AGIBrain(config, self.logger)
         
+        # ========================================================================
+        # NEW: Keyword Detection and Audio Listening Setup
+        # ========================================================================
+        # Create keyword detector for "hello baby" wake word detection
+        # This allows the system to listen passively and only respond when woken
+        self.keyword_detector = KeywordDetector(keyword="hello baby")
+        
+        # Create audio listener that runs in background thread
+        # It continuously records and checks for the wake word
+        self.audio_listener = AudioListener(
+            audio_handler=self.audio,
+            keyword_detector=self.keyword_detector,
+            logger=self.logger
+        )
+        # ========================================================================
+        
+        # ========================================================================
+        # NEW: Vision Monitor Setup (Modular)
+        # ========================================================================
+        # Shared alert queue for all background threads to communicate hazards
+        self.alert_queue: Queue = Queue()
+        
+        # Create vision monitor that runs in background thread
+        # It continuously captures frames and alerts on hazards
+        self.vision_monitor = VisionMonitor(
+            vision_handler=self.vision,
+            alert_queue=self.alert_queue,
+            config=config,
+            logger=self.logger
+        )
+        # ========================================================================
+        
         # State management
         self.running = False
         self.vehicle_state = VehicleState.IDLE
@@ -1220,8 +1503,6 @@ class DashboardAGI:
         
         # Threading
         self.obd_thread: Optional[threading.Thread] = None
-        self.vision_thread: Optional[threading.Thread] = None
-        self.alert_queue: Queue = Queue()
         
         self.logger.info("Dashboard AGI initialized successfully")
     
@@ -1233,9 +1514,22 @@ class DashboardAGI:
         self.obd_thread = threading.Thread(target=self._obd_monitor_loop, daemon=True)
         self.obd_thread.start()
         
-        # Vision monitoring thread
-        self.vision_thread = threading.Thread(target=self._vision_monitor_loop, daemon=True)
-        self.vision_thread.start()
+        # ========================================================================
+        # REFACTORED: Vision monitoring now uses VisionMonitor class
+        # ========================================================================
+        # Instead of creating thread here, use modular VisionMonitor instance
+        # Same functionality but cleaner and reusable
+        self.vision_monitor.start()
+        # ========================================================================
+        
+        # ========================================================================
+        # Start audio listener thread for continuous wake-word detection
+        # ========================================================================
+        # This starts the background listener that continuously records and checks
+        # for "hello baby" keyword. When keyword is detected, it signals main thread via event.
+        # Main thread will then wait for voice input and process it.
+        self.audio_listener.start()
+        # ========================================================================
     
     def _obd_monitor_loop(self):
         """Background thread for continuous OBD monitoring."""
@@ -1262,33 +1556,7 @@ class DashboardAGI:
                 self.logger.error(f"OBD monitor error: {e}")
                 time.sleep(5)
     
-    def _vision_monitor_loop(self):
-        """Background thread for periodic vision analysis."""
-        self.logger.info("Vision monitor thread started")
-        
-        while self.running:
-            try:
-                # Capture and analyze frame
-                frame = self.vision.capture_frame()
-                if frame is not None:
-                    analysis = self.vision.analyze_frame(frame)
-                    self.last_vision_analysis = datetime.now()
-                    
-                    # Save frame
-                    self.vision.save_frame(frame)
-                    
-                    # Check for hazards
-                    if analysis.hazards_detected:
-                        for hazard in analysis.hazards_detected:
-                            self.alert_queue.put((AlertLevel.WARNING, hazard))
-                
-                # Sleep until next analysis
-                time.sleep(self.config.VISION_ANALYSIS_INTERVAL)
-                
-            except Exception as e:
-                self.logger.error(f"Vision monitor error: {e}")
-                time.sleep(30)
-    
+
     def process_alerts(self):
         """Process any pending alerts from background threads."""
         try:
@@ -1312,27 +1580,44 @@ class DashboardAGI:
             self.logger.error(f"Error processing alerts: {e}")
     
     def handle_voice_interaction(self):
-        """Handle one voice interaction cycle."""
+        """
+        Handle one full voice interaction cycle.
+        
+        Called by main loop ONLY after wake word ("hello baby") is detected by AudioListener.
+        
+        Flow:
+        1. Record fresh audio (user's full command)
+        2. Transcribe to text
+        3. Process with AGI brain (get response)
+        4. Speak response back to user
+        5. Wait for playback to complete before returning to listening
+        
+        This is called infrequently (only when wake word detected), unlike the old flow
+        where it was called in every loop iteration.
+        """
         try:
-            # Record audio
-            self.logger.info("Listening for driver input...")
+            # Record audio - NOW this is only called after keyword is detected
+            # So we can be confident the user is actually trying to talk to us
+            self.logger.info("Listening for driver command...")
             audio_file = self.audio.record_audio()
             
-            # Transcribe
+            # Transcribe the audio to text
             user_input = self.audio.transcribe_audio(audio_file)
             
+            # If transcription failed or got empty result, return early
             if not user_input:
+                self.logger.warning("No speech detected in recording")
                 return
             
             self.logger.info(f"Driver: '{user_input}'")
             
-            # Check for exit command
+            # Check for exit/shutdown command to stop the system
             if any(word in user_input.lower() for word in ["shutdown", "exit", "quit"]):
                 self.audio.speak_text("Shutting down dashboard AGI. Drive safely.")
                 self.running = False
                 return
             
-            # Get current system state
+            # Gather current system state from all sensors
             obd_data = self.obd.last_data
             vision_analysis = self.vision.last_analysis
             navigation_info = {
@@ -1340,7 +1625,7 @@ class DashboardAGI:
                 'route': self.navigation.current_route
             }
             
-            # Process with AGI brain
+            # Process user input through AGI brain to generate intelligent response
             response = self.brain.process_input(
                 user_input,
                 obd_data,
@@ -1348,49 +1633,85 @@ class DashboardAGI:
                 navigation_info
             )
             
-            # Speak response
+            # Speak the response back to user
             self.audio.speak_text(response)
             
-            # FIX for self-recording issue: Wait for audio playback to finish
-            # PROBLEM: speak_text() uses os.system(f"start {speech_path}") which launches
-            # Windows Media Player asynchronously and returns immediately without waiting
-            # SOLUTION: Add delay before next recording cycle to ensure playback completes
-            # REASON: If recording starts while playback is ongoing, microphone captures
-            # the speaker output, creating an echo that gets recorded and transcribed
-            # TIMING: 15 seconds allows most conversational responses to finish playing
-            # before the system is ready to listen again
-            self.logger.info(f"Waiting {self.config.AUDIO_PLAYBACK_DELAY} seconds for audio playback to complete...")
+            # ====================================================================
+            # IMPORTANT: Wait for audio playback to complete before returning
+            # ====================================================================
+            # REASON: speak_text() uses os.system(f"start {speech_path}") which launches
+            # Windows Media Player asynchronously and returns immediately without waiting.
+            # PROBLEM: If the listener thread resumes recording while playback is ongoing,
+            # the microphone will pick up the speaker output, creating echo/self-recording.
+            # SOLUTION: Delay ensures playback completes before listener resumes recording.
+            # TIMING: 15 seconds allows typical conversational responses to finish playing
+            # and accounts for natural pause before user speaks the next wake word.
+            self.logger.info(
+                f"Waiting {self.config.AUDIO_PLAYBACK_DELAY}s for audio playback to complete "
+                f"before resuming listening..."
+            )
             time.sleep(self.config.AUDIO_PLAYBACK_DELAY)
+            # ====================================================================
             
         except Exception as e:
             self.logger.error(f"Voice interaction error: {e}")
             self.audio.speak_text("I didn't catch that. Could you repeat?")
     
     def run(self):
-        """Main event loop."""
+        """
+        Main event loop.
+        
+        NEW BEHAVIOR with Always-Listening:
+        1. Start background tasks (OBD, vision, AND audio listener)
+        2. Main loop continuously:
+           a) Process any alerts from other threads
+           b) Check if wake word was detected (non-blocking wait with timeout)
+           c) If wake word detected: call handle_voice_interaction() for full command
+           d) Loop continues indefinitely with minimal delay
+        
+        KEY BENEFIT: Main thread is NOT blocked on record_audio() anymore.
+        Instead it waits on a threading.Event, allowing responsive alert processing.
+        """
         self.running = True
         self.logger.info("=" * 80)
-        self.logger.info("DASHBOARD AGI IS NOW ACTIVE")
+        self.logger.info("DASHBOARD AGI IS NOW ACTIVE - LISTENING FOR 'HELLO BABY'")
         self.logger.info("=" * 80)
         
         try:
-            # Start background monitoring
+            # Start all background monitoring threads (OBD, vision, audio listener)
             self.start_background_tasks()
             
             # Initial greeting
             self.audio.speak_text(
-                "Dashboard AGI online. All systems operational. How can I assist you?"
+                "Dashboard AGI online. All systems operational. Listening for hello baby..."
             )
             
-            # Main loop
+            # Main event loop
             while self.running:
-                # Process any alerts
+                # ====================================================================
+                # Process any pending alerts from OBD/Vision threads
+                # ====================================================================
                 self.process_alerts()
                 
-                # Handle voice interaction
-                self.handle_voice_interaction()
+                # ====================================================================
+                # NEW: Non-blocking wait for keyword detection
+                # ====================================================================
+                # Wait for up to 0.5 seconds for keyword to be detected
+                # If keyword detected within timeout, proceed to voice interaction
+                # If timeout, loop continues and checks for alerts again
+                # This is MUCH more responsive than blocking on 5-second recording!
+                if self.audio_listener.keyword_detected_event.wait(timeout=0.5):
+                    # Keyword was detected! Reset event for next detection cycle
+                    self.audio_listener.reset_detection()
+                    
+                    # Log the wake event
+                    self.logger.info("Wake word detected - proceeding to voice interaction")
+                    
+                    # Now handle the full voice interaction (record command, process, respond)
+                    self.handle_voice_interaction()
+                # ====================================================================
                 
-                # Small delay
+                # Small delay to prevent CPU spinning
                 time.sleep(self.config.MAIN_LOOP_DELAY)
                 
         except KeyboardInterrupt:
@@ -1401,22 +1722,40 @@ class DashboardAGI:
             self.shutdown()
     
     def shutdown(self):
-        """Clean shutdown of all systems."""
+        """
+        Clean shutdown of all systems.
+        
+        Gracefully terminates all threads and releases resources:
+        - Stops audio listener (so it stops recording)
+        - Stops OBD/vision monitoring
+        - Waits for threads to finish
+        - Closes camera/vision system
+        """
         self.logger.info("=" * 80)
         self.logger.info("DASHBOARD AGI SHUTTING DOWN")
         self.logger.info("=" * 80)
         
         self.running = False
         
+        # ========================================================================
+        # Stop background monitoring threads
+        # ========================================================================
+        # Stop audio listener (prevents continuing to record)
+        if self.audio_listener:
+            self.audio_listener.stop()
+        
+        # Stop vision monitor (prevents continuing to analyze)
+        if self.vision_monitor:
+            self.vision_monitor.stop()
+        # ========================================================================
+        
         # Cleanup resources
         if self.vision:
             self.vision.cleanup()
         
-        # Wait for threads
+        # Wait for OBD monitoring thread to finish
         if self.obd_thread:
             self.obd_thread.join(timeout=2)
-        if self.vision_thread:
-            self.vision_thread.join(timeout=2)
         
         self.logger.info("Shutdown complete")
 
